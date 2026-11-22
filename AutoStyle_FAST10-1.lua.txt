@@ -1,0 +1,469 @@
+if not game:IsLoaded() then game.Loaded:Wait() end
+
+local ModernV2 = loadstring(game:HttpGet("https://robloxui.vercel.app/"))()
+
+--// ====== CAU HINH NHANH ======
+local AUTO_START     = true  -- mo script la quay luon (khong can bat/tat toggle)
+local DEFAULT_TARGET = ""    -- dien san ten style neu muon, vd "Sanju" (hoac nhap trong GUI 1 lan, script se nho)
+local DEFAULT_LIMIT  = 10    -- so luot roll truoc khi Data Rollback
+local UI_TIMEOUT     = 0.5   -- toi da cho UI cap nhat style sau moi lan roll (giay)
+
+local Window = ModernV2:Window({
+    Title = "Target Style Roll",
+    Content = "Volleyball Legends",
+    Color = Color3.fromRGB(128, 0, 255),
+    Size = UDim2.fromOffset(500, 350),
+    ShowUser = true,
+    Search = true,
+
+    Config = {
+        ConfigFolder = "TargetStyleRollConfigs",
+        AutoSave = true
+    },
+})
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TeleportService = game:GetService("TeleportService")
+local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+
+local LocalPlayer = Players.LocalPlayer
+local bootTime = os.clock()
+
+--// ====== TRANG THAI + LUU RIENG (de mo len la quay duoc ngay) ======
+local STATE_FILE = "TargetStyleRoll_state.json"
+
+local state = { target = DEFAULT_TARGET, spinType = "Normal", limit = DEFAULT_LIMIT }
+
+pcall(function()
+    if type(isfile) == "function" and isfile(STATE_FILE) then
+        local data = HttpService:JSONDecode(readfile(STATE_FILE))
+        if type(data) == "table" then
+            if type(data.target) == "string" and data.target ~= "" then state.target = data.target end
+            if data.spinType == "Normal" or data.spinType == "Lucky" then state.spinType = data.spinType end
+            if tonumber(data.limit) then state.limit = math.clamp(math.floor(tonumber(data.limit)), 1, 25) end
+        end
+    end
+end)
+
+local function saveState()
+    pcall(function()
+        if type(writefile) == "function" then
+            writefile(STATE_FILE, HttpService:JSONEncode(state))
+        end
+    end)
+end
+
+local autoSpin = false
+local spinType = state.spinType
+local targetStyle = state.target
+local rollbackLimit = state.limit
+local rollRunning = false
+local userStopped = false
+
+--// ====== TIEN ICH ======
+local function norm(s)
+    return (tostring(s or ""):lower():gsub("[^%w]", ""))
+end
+
+local function sameStyle(a, b)
+    local x, y = norm(a), norm(b)
+    return x ~= "" and x == y
+end
+
+local function notify(title, content, duration)
+    pcall(function()
+        Window:Notify({ Title = title, Content = content, Duration = duration or 3 })
+    end)
+end
+
+--// GET CURRENT STYLE
+local function getCurrentStyle()
+    local success, result = pcall(function()
+        return LocalPlayer.PlayerGui
+            .Interface
+            .Lobby
+            .Styles
+            .TopPanel
+            .DisplayName
+            .Text
+    end)
+
+    if success then
+        return result
+    end
+
+    return nil
+end
+
+--// DATA ROLLBACK
+local function dataRollback()
+    local Remote = ReplicatedStorage
+        :WaitForChild("Packages")
+        :WaitForChild("_Index")
+        :WaitForChild("sleitnick_knit@1.7.0")
+        :WaitForChild("knit")
+        :WaitForChild("Services")
+        :WaitForChild("SettingsService")
+        :WaitForChild("RF")
+        :WaitForChild("UpdateKeybind")
+
+    local success, err = pcall(function()
+        Remote:InvokeServer(
+            "MouseButton1",
+            true,
+            "Spike\xE2\x80\x8B\x8F"
+        )
+    end)
+
+    return success, err
+end
+
+--// LAY REMOTE ROLL 1 LAN (khong tim lai moi luot)
+local function getRollRemote(timeout)
+    local ok, remote = pcall(function()
+        local svc = ReplicatedStorage
+            :WaitForChild("Packages", timeout)
+            :WaitForChild("_Index", timeout)
+            :WaitForChild("sleitnick_knit@1.7.0", timeout)
+            :WaitForChild("knit", timeout)
+            :WaitForChild("Services", timeout)
+            :WaitForChild("StyleService", timeout)
+        local RF = svc:WaitForChild("RF", timeout)
+        return RF:WaitForChild("Roll", timeout)
+    end)
+    if ok then return remote end
+    return nil
+end
+
+--// Neu server tra ve ten style thi dung luon, khong phai doi UI
+local function styleFromResult(...)
+    for i = 1, select("#", ...) do
+        local v = select(i, ...)
+        if type(v) == "string" and v ~= "" then
+            return v
+        end
+        if type(v) == "table" then
+            for _, key in ipairs({ "Style", "style", "Name", "name", "Result", "result" }) do
+                if type(v[key]) == "string" and v[key] ~= "" then
+                    return v[key]
+                end
+            end
+        end
+    end
+    return nil
+end
+
+--// Cho UI doi style, kiem tra MOI KHUNG HINH (khong sleep co dinh)
+local function waitStyleChange(prev, timeout)
+    local t0 = os.clock()
+    local s = getCurrentStyle()
+    while s == prev and autoSpin and (os.clock() - t0) < timeout do
+        RunService.Heartbeat:Wait()
+        s = getCurrentStyle()
+    end
+    return s
+end
+
+--// REJOIN
+local function rejoin()
+    autoSpin = false
+    task.wait(0.2)
+    pcall(function()
+        TeleportService:Teleport(game.PlaceId)
+    end)
+end
+
+--// ====== VONG ROLL NHANH ======
+-- tra ve: "found", style | "limit", so_luot | "nospins", so_luot | "stopped" | "error"
+local function runRolls()
+    local Roll = getRollRemote(10)
+    if not Roll then
+        notify("Roll Error", "Khong tim thay StyleService/Roll", 4)
+        return "error"
+    end
+
+    local maxRolls = rollbackLimit
+    local done, fails = 0, 0
+
+    while autoSpin and done < maxRolls do
+        local before = getCurrentStyle()
+        if sameStyle(before, targetStyle) then
+            return "found", before
+        end
+
+        local ok, r1, r2 = pcall(function()
+            return Roll:InvokeServer(spinType == "Lucky")
+        end)
+
+        if ok and r1 ~= false then
+            done = done + 1
+            fails = 0
+
+            local hint = styleFromResult(r1, r2)
+            if hint and sameStyle(hint, targetStyle) then
+                return "found", hint
+            end
+
+            local after
+            if hint and sameStyle(hint, before) then
+                after = before -- ra lai style cu, khong can doi UI
+            else
+                after = waitStyleChange(before, UI_TIMEOUT)
+            end
+
+            if sameStyle(after, targetStyle) then
+                return "found", after
+            end
+            -- chua trung: roll tiep NGAY, khong sleep
+        else
+            -- roll that bai (het luot / bi gioi han): thu lai nhanh vai lan roi coi nhu het luot
+            fails = fails + 1
+            if fails >= 3 then
+                return "nospins", done
+            end
+            task.wait(0.15)
+        end
+    end
+
+    if not autoSpin then
+        return "stopped"
+    end
+    return "limit", done
+end
+
+--// TARGET ROLL
+local function startTargetRoll()
+    if rollRunning then return end
+
+    if targetStyle == "" then
+        autoSpin = false
+        notify("Target Style", "Chua co ten Style! Nhap ten roi bat Auto Target Roll.", 4)
+        return
+    end
+
+    rollRunning = true
+
+    task.spawn(function()
+        local okRun, status, info = pcall(runRolls)
+        rollRunning = false
+
+        if not okRun then
+            autoSpin = false
+            notify("Roll Error", tostring(status), 4)
+            return
+        end
+
+        if status == "found" then
+            autoSpin = false
+            notify("Target Obtained!", tostring(info), 5)
+            return
+        end
+
+        if status == "limit" or status == "nospins" then
+            if (info or 0) == 0 then
+                -- chua roll duoc lan nao: khong rollback de tranh rejoin vo han
+                autoSpin = false
+                notify("Roll Error", "Khong roll duoc lan nao (het luot?)", 4)
+                return
+            end
+
+            if not autoSpin then return end -- da bam Stop: khong rollback/rejoin
+
+            notify("Target Not Found",
+                "Da roll " .. tostring(info) .. " lan. Data Rollback...", 3)
+
+            local success = dataRollback()
+            if not success then
+                autoSpin = false
+                notify("Data Rollback Failed", "Rollback remote failed.", 3)
+                return
+            end
+
+            if not autoSpin then return end -- bam Stop luc dang rollback: khong rejoin
+
+            notify("Rejoining", "Rollback xong. Rejoining...", 3)
+            rejoin()
+            return
+        end
+        -- "stopped" / "error": khong lam gi them
+    end)
+end
+
+--// STOP + RESET: dung ngay va xoa moi cai dat da luu
+local function stopAndReset()
+    userStopped = true
+    autoSpin = false -- vong roll dung ngay sau luot dang chay (khong rollback, khong rejoin)
+
+    targetStyle = ""
+    spinType = "Normal"
+    rollbackLimit = DEFAULT_LIMIT
+    state.target = ""
+    state.spinType = "Normal"
+    state.limit = DEFAULT_LIMIT
+
+    -- xoa file luu rieng (de lan mo sau khong tu quay)
+    pcall(function()
+        if type(isfile) == "function" and type(delfile) == "function" and isfile(STATE_FILE) then
+            delfile(STATE_FILE)
+        elseif type(writefile) == "function" then
+            writefile(STATE_FILE, "{}")
+        end
+    end)
+
+    -- reset config cua thu vien UI (giong nut Reset Config)
+    pcall(function()
+        Window:SaveConfig("Default", true)
+        Window:LoadConfig("Default")
+    end)
+
+    notify("Stop & Reset", "Da dung va reset moi cai dat", 3)
+end
+
+--// ====== GUI ======
+local MainTab = Window:AddTab({
+    Name = "Target Roll",
+    Icon = "crosshairs",
+    Type = "Double"
+})
+
+local RollSection = MainTab:AddSection({
+    Name = "AUTO TARGET STYLE",
+    Position = "Center"
+})
+
+--// TARGET STYLE
+RollSection:AddInput({
+    Name = "Target Style",
+    Placeholder = "Ví dụ: Sanju",
+    Flag = "targetstyle",
+
+    Callback = function(v)
+        targetStyle = tostring(v or "")
+        state.target = targetStyle
+        saveState()
+        notify("Target Set", "Target: " .. targetStyle, 2)
+    end
+})
+
+--// SPIN TYPE
+RollSection:AddDropdown({
+    Name = "Spin Type",
+    Values = { "Normal", "Lucky" },
+    Default = spinType,
+    Flag = "spintype",
+
+    Callback = function(v)
+        spinType = v
+        state.spinType = v
+        saveState()
+    end
+})
+
+--// SO LAN ROLL TRUOC KHI DATA ROLLBACK
+local limitValues = {}
+for i = 1, 25 do
+    limitValues[i] = tostring(i)
+end
+
+RollSection:AddDropdown({
+    Name = "Rolls Before Data Rollback",
+    Values = limitValues,
+    Default = tostring(rollbackLimit),
+    Flag = "rollbacklimit",
+
+    Callback = function(v)
+        rollbackLimit = tonumber(v) or DEFAULT_LIMIT
+        state.limit = rollbackLimit
+        saveState()
+    end
+})
+
+--// AUTO TARGET ROLL
+RollSection:AddToggle({
+    Name = "Auto Target Roll",
+    Default = (AUTO_START and targetStyle ~= ""),
+    Flag = "autotargetroll",
+
+    Callback = function(v)
+        -- bo qua cac lan goi lai khong doi trang thai (vd luc config tu nap)
+        if v == autoSpin then return end
+        -- 3 giay dau: bo qua lenh TAT do config cu nap lai, de khong lam dung auto-start
+        if (not v) and AUTO_START and (os.clock() - bootTime) < 3 then return end
+
+        autoSpin = v
+
+        if v then
+            startTargetRoll()
+        else
+            notify("Auto Target Roll", "STOPPED", 2)
+        end
+    end
+})
+
+--// STOP + RESET
+RollSection:AddButton({
+    Name = "Stop & Reset",
+    Callback = stopAndReset
+})
+
+--// MANUAL DATA ROLLBACK
+RollSection:AddButton({
+    Name = "Data Rollback",
+
+    Callback = function()
+        local success = dataRollback()
+        notify("Data Rollback", success and "Executed!" or "Failed!", 2)
+    end
+})
+
+--// SETTINGS TAB
+local SettingsTab = Window:AddTab({
+    Name = "Settings",
+    Icon = "gear"
+})
+
+local ConfigSection = SettingsTab:AddSection({
+    Name = "CONFIG",
+    Position = "Center"
+})
+
+ConfigSection:AddButton({
+    Name = "Save Config",
+    Callback = function()
+        Window:SaveConfig()
+        notify("Config Saved", "Settings saved!", 2)
+    end
+})
+
+ConfigSection:AddButton({
+    Name = "Load Config",
+    Callback = function()
+        Window:LoadConfig()
+        notify("Config Loaded", "Settings loaded!", 2)
+    end
+})
+
+ConfigSection:AddButton({
+    Name = "Reset Config",
+    Callback = function()
+        Window:SaveConfig("Default", true)
+        Window:LoadConfig("Default")
+        notify("Config Reset", "Settings reset!", 2)
+    end
+})
+
+--// ====== TU QUAY KHI MO SCRIPT ======
+if AUTO_START then
+    task.spawn(function()
+        task.wait(2) -- cho GUI va config nap xong
+        if rollRunning or userStopped then return end
+        if targetStyle == "" then
+            notify("Auto Start", "Chua co Target Style. Nhap ten 1 lan, lan sau se tu quay.", 5)
+            return
+        end
+        autoSpin = true
+        startTargetRoll()
+    end)
+end
